@@ -1,0 +1,1391 @@
+import java.io.*;
+import java.net.*;  // Add this import for Socket
+import java.rmi.*;
+import java.rmi.server.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.atomic.*;
+
+public class CoordinatorImpl extends UnicastRemoteObject implements CoordinatorInterface {
+    private Map<String, User> users = new HashMap<>();
+    private Map<String, User> tokenToUser = new HashMap<>();
+    private List<NodeInfo> nodes = new ArrayList<>();
+    private AtomicInteger currentNodeIndex = new AtomicInteger(0);
+    private Map<String, List<FileMetadata>> fileIndex = new HashMap<>();
+    private String managerToken = "MANAGER_TOKEN"; // In real system, generate properly
+
+    public CoordinatorImpl() throws RemoteException {
+        super();
+        // Initialize with manager user
+        User manager = new User("manager", "manager123", "management");
+        manager.addPermission("manage_users");
+        manager.addPermission("manage_nodes");
+        manager.setToken(managerToken);
+        users.put("manager", manager);
+        tokenToUser.put(managerToken, manager);
+    }
+
+    @Override
+    public boolean createFile(String token, FileData file) throws RemoteException {
+        // 1. Validate user authentication
+        User user = tokenToUser.get(token);
+        if (user == null) {
+            throw new RemoteException("Authentication failed: Invalid token");
+        }
+
+        // 2. Validate department permissions
+        if (!user.getDepartment().equals(file.getDepartment())) {
+            throw new RemoteException("Permission denied: You can only create files in your department (" +
+                    user.getDepartment() + ")");
+        }
+
+        // 3. Validate filename
+        if (file.getFilename() == null || file.getFilename().trim().isEmpty()) {
+            throw new RemoteException("Invalid filename: Filename cannot be empty");
+        }
+        if (file.getFilename().contains("/") || file.getFilename().contains("\\")) {
+            throw new RemoteException("Invalid filename: Cannot contain path separators");
+        }
+
+        // 4. Validate content
+        if (file.getContent() == null) {
+            throw new RemoteException("Invalid content: File content cannot be null");
+        }
+        if (file.getContent().length > 10 * 1024 * 1024) { // 10MB limit
+            throw new RemoteException("File too large: Maximum size is 10MB");
+        }
+
+        // 5. Check for available nodes
+        if (nodes.isEmpty()) {
+            throw new RemoteException("System error: No storage nodes available");
+        }
+
+        // 6. Select node using round-robin with retry logic
+        int attempts = 0;
+        int maxAttempts = nodes.size();
+        NodeInfo node = null;
+
+        while (attempts < maxAttempts) {
+            node = nodes.get(currentNodeIndex.getAndIncrement() % nodes.size());
+
+            if (node.isActive()) {
+                try {
+                    // 7. Connect to node and send file
+                    try (Socket socket = new Socket(node.getAddress(), node.getPort());
+                         ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                         ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+                        // Set timeout for node communication
+                        socket.setSoTimeout(5000); // 5 seconds timeout
+
+                        out.writeObject("UPLOAD");
+                        out.writeObject(file);
+
+                        // 8. Verify node response
+                        String response = (String) in.readObject();
+                        if (!"OK: File created".equals(response)) {
+                            throw new RemoteException("Node error: " + response);
+                        }
+
+                        // 9. Verify file was actually created
+                        if (!verifyFileOnNode(node, file.getDepartment(), file.getFilename())) {
+                            throw new RemoteException("Verification failed: File not found on node");
+                        }
+
+                        // 10. Update file index
+                        FileMetadata metadata = new FileMetadata(
+                                file.getFilename(),
+                                file.getDepartment(),
+                                node.getAddress(),
+                                node.getPort()
+                        );
+
+                        synchronized (fileIndex) {
+                            fileIndex.computeIfAbsent(file.getDepartment(), k -> new ArrayList<>())
+                                    .add(metadata);
+                        }
+
+                        return true;
+                    }
+                } catch (SocketTimeoutException e) {
+                    System.err.println("Timeout with node " + node.getNodeId() + ", trying next node");
+                    node.setActive(false); // Mark node as inactive
+                } catch (IOException | ClassNotFoundException e) {
+                    System.err.println("Error with node " + node.getNodeId() + ": " + e.getMessage());
+                    node.setActive(false); // Mark node as inactive
+                }
+            }
+            attempts++;
+        }
+
+        throw new RemoteException("Failed after " + maxAttempts + " attempts: No responsive nodes available");
+    }
+
+    @Override
+    public byte[] readFile(String token, String filename, String department) throws RemoteException {
+        // 1. Validate user authentication
+        User user = tokenToUser.get(token);
+        if (user == null) {
+            throw new RemoteException("Authentication failed: Invalid token");
+        }
+
+        // 2. Check if user has access to this department
+      /*  if (!user.getDepartment().equals(department)) {
+            throw new RemoteException("Permission denied: You can only read files in your department");
+        }*/
+
+        // 3. Find the file in the index
+        synchronized (fileIndex) {
+            List<FileMetadata> deptFiles = fileIndex.get(department);
+            if (deptFiles != null) {
+                for (FileMetadata metadata : deptFiles) {
+                    if (metadata.getFilename().equals(filename)) {
+                        // 4. Retrieve file from node
+                        try (Socket socket = new Socket(metadata.getNodeAddress(), metadata.getNodePort());
+                             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+                            out.writeObject("DOWNLOAD");
+                            out.writeObject(department);
+                            out.writeObject(filename);
+
+                            Object response = in.readObject();
+                            if (response instanceof FileData) {
+                                return ((FileData) response).getContent();
+                            } else {
+                                throw new RemoteException("Node error: " + response);
+                            }
+                        } catch (Exception e) {
+                            throw new RemoteException("Failed to read file from node: " + e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
+
+        throw new RemoteException("File not found");
+    }
+
+
+
+    private void addTestNodes() {
+    try {
+        // Add 3 test nodes
+        nodes.add(new NodeInfo("node1", "localhost", 8001));
+        nodes.add(new NodeInfo("node2", "localhost", 8002));
+        nodes.add(new NodeInfo("node3", "localhost", 8003));
+
+        System.out.println("Added 3 test nodes:");
+        for (NodeInfo node : nodes) {
+            System.out.println("- " + node.getNodeId() + " at " +
+                            node.getAddress() + ":" + node.getPort());
+        }
+        } catch (Exception e) {
+            System.err.println("Error adding test nodes: " + e.getMessage());
+        }
+    }
+
+
+    @Override
+    public String login(String username, String password) throws RemoteException {
+        User user = users.get(username);
+        if (user != null && user.getPassword().equals(password)) {
+            String token = UUID.randomUUID().toString();
+            user.setToken(token);
+            tokenToUser.put(token, user);
+            return token;
+        }
+        throw new RemoteException("Invalid credentials");
+    }
+
+    @Override
+    public boolean registerUser(String managerToken, User user) throws RemoteException {
+        User manager = tokenToUser.get(managerToken);
+        if (manager == null || !manager.hasPermission("manage_users")) {
+            throw new RemoteException("Permission denied");
+        }
+        users.put(user.getUsername(), user);
+        return true;
+    }
+
+    @Override
+    public FileMetadata searchFile(String token, String filename, String department) throws RemoteException {
+        User user = tokenToUser.get(token);
+        if (user == null) {
+            throw new RemoteException("Invalid token");
+        }
+
+        // Check if there are any nodes
+        if (nodes.isEmpty()) {
+            throw new RemoteException("No storage nodes available");
+        }
+
+        // Load balancing: round-robin approach
+        int attempts = 0;
+        while (attempts < nodes.size()) {
+            int index = currentNodeIndex.getAndIncrement() % nodes.size();
+            NodeInfo node = nodes.get(index);
+
+            if (node.isActive()) {
+                // In real system, would check if file exists on this node
+                // For simplicity, we'll just return the first active node
+                return new FileMetadata(filename, department, node.getAddress(), node.getPort());
+            }
+            attempts++;
+        }
+
+        throw new RemoteException("No active nodes available");
+    }
+
+    @Override
+    public boolean uploadFile(String token, FileData file) throws RemoteException {
+        User user = tokenToUser.get(token);
+        if (user == null) throw new RemoteException("Invalid token");
+        if (!user.getDepartment().equals(file.getDepartment()))
+            throw new RemoteException("You can only upload to your department");
+
+        if (nodes.isEmpty()) throw new RemoteException("No storage nodes available");
+
+        NodeInfo node = nodes.get(currentNodeIndex.getAndIncrement() % nodes.size());
+
+        try (Socket socket = new Socket(node.getAddress(), node.getPort());
+            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("UPLOAD");
+            out.writeObject(file);
+
+            String response = (String) in.readObject();
+            if (!"OK: File uploaded".equals(response)) {
+                throw new RemoteException("Node upload failed: " + response);
+            }
+
+            // Verify file actually exists on node
+            if (!verifyFileOnNode(node, file.getDepartment(), file.getFilename())) {
+                throw new RemoteException("File verification failed after upload");
+            }
+
+            FileMetadata metadata = new FileMetadata(file.getFilename(),
+                                                file.getDepartment(),
+                                                node.getAddress(),
+                                                node.getPort());
+            fileIndex.computeIfAbsent(file.getDepartment(), k -> new ArrayList<>())
+                    .add(metadata);
+            return true;
+        } catch (Exception e) {
+            throw new RemoteException("Upload failed: " + e.getMessage());
+        }
+    }
+
+    private boolean verifyFileOnNode(NodeInfo node, String department, String filename) {
+        try (Socket socket = new Socket(node.getAddress(), node.getPort());
+            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("VERIFY");
+            out.writeObject(department);
+            out.writeObject(filename);
+
+            return (boolean) in.readObject();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    @Override
+    public boolean updateFile(String token, FileData file) throws RemoteException {
+        // 1. Validate user authentication
+        User user = tokenToUser.get(token);
+        if (user == null) {
+            throw new RemoteException("Authentication failed: Invalid token");
+        }
+
+        // 2. Validate department permissions
+        if (!user.getDepartment().equals(file.getDepartment())) {
+            throw new RemoteException("Permission denied: You can only update files in your department (" +
+                    user.getDepartment() + ")");
+        }
+
+        // 3. Find the file in the index
+        FileMetadata metadata = null;
+        synchronized (fileIndex) {
+            List<FileMetadata> deptFiles = fileIndex.get(file.getDepartment());
+            if (deptFiles != null) {
+                for (FileMetadata m : deptFiles) {
+                    if (m.getFilename().equals(file.getFilename())) {
+                        metadata = m;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (metadata == null) {
+            throw new RemoteException("File not found in index");
+        }
+
+        // 4. Connect to the node where the file is stored
+        try (Socket socket = new Socket(metadata.getNodeAddress(), metadata.getNodePort());
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("UPDATE");
+            out.writeObject(file);
+
+            // 5. Verify node response
+            String response = (String) in.readObject();
+            if (!"OK: File updated".equals(response)) {
+                throw new RemoteException("Node error: " + response);
+            }
+
+            // 6. Verify file was actually updated
+            if (!verifyFileOnNode(metadata, file.getContent())) {
+                throw new RemoteException("Verification failed: File not properly updated on node");
+            }
+
+            return true;
+        } catch (Exception e) {
+            throw new RemoteException("Failed to update file: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public boolean syncAllNodes(String managerToken) throws RemoteException {
+        User manager = tokenToUser.get(managerToken);
+        if (manager == null || !manager.hasPermission("manage_nodes")) {
+            throw new RemoteException("Permission denied");
+        }
+
+        System.out.println("Starting full node synchronization...");
+
+        // Create sync clients for each node
+        Map<String, NodeSyncClient> syncClients = new HashMap<>();
+        for (NodeInfo node : nodes) {
+            syncClients.put(node.getNodeId(), new NodeSyncClient(node.getNodeId(), nodes));
+        }
+
+        // Run sync for each node
+        for (NodeSyncClient syncClient : syncClients.values()) {
+            try {
+                System.out.println("Syncing node " + syncClient.getNodeId() + "...");
+                syncClient.sync();
+                System.out.println("Sync completed for node " + syncClient.getNodeId());
+            } catch (Exception e) {
+                System.err.println("Error syncing node " + syncClient.getNodeId() + ": " + e.getMessage());
+            }
+        }
+
+        System.out.println("Full node synchronization completed");
+        return true;
+    }
+    @Override
+    public User getUserByToken(String token) throws RemoteException {
+        return tokenToUser.get(token);
+    }
+
+
+    private boolean verifyFileOnNode(FileMetadata metadata, byte[] expectedContent) {
+        try (Socket socket = new Socket(metadata.getNodeAddress(), metadata.getNodePort());
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("VERIFY_CONTENT");
+            out.writeObject(metadata.getDepartment());
+            out.writeObject(metadata.getFilename());
+            out.writeObject(expectedContent);
+
+            return (boolean) in.readObject();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+
+
+    @Override
+    public List<NodeInfo> getActiveNodes() throws RemoteException {
+        List<NodeInfo> activeNodes = new ArrayList<>();
+        for (NodeInfo node : nodes) {
+            if (node.isActive()) {
+                activeNodes.add(node);
+            }
+        }
+        return activeNodes;
+    }
+
+    @Override
+    public boolean addNode(String managerToken, NodeInfo node) throws RemoteException {
+        User manager = tokenToUser.get(managerToken);
+        if (manager == null || !manager.hasPermission("manage_nodes")) {
+            throw new RemoteException("Permission denied");
+        }
+        nodes.add(node);
+        return true;
+    }
+
+    @Override
+    public boolean deleteFile(String token, String filename, String department) throws RemoteException {
+        // 1. Validate user authentication
+        User user = tokenToUser.get(token);
+        if (user == null) {
+            throw new RemoteException("Authentication failed: Invalid token");
+        }
+
+        // 2. Check if user has access to this department
+        if (!user.getDepartment().equals(department)) {
+            throw new RemoteException("Permission denied: You can only delete files in your department");
+        }
+
+        // 3. Find the file in the index
+        FileMetadata metadata = null;
+        synchronized (fileIndex) {
+            List<FileMetadata> deptFiles = fileIndex.get(department);
+            if (deptFiles != null) {
+                Iterator<FileMetadata> iterator = deptFiles.iterator();
+                while (iterator.hasNext()) {
+                    FileMetadata m = iterator.next();
+                    if (m.getFilename().equals(filename)) {
+                        metadata = m;
+                        iterator.remove();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (metadata == null) {
+            throw new RemoteException("File not found in index");
+        }
+
+        // 4. Connect to the node where the file is stored and delete it
+        try (Socket socket = new Socket(metadata.getNodeAddress(), metadata.getNodePort());
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("DELETE");
+            out.writeObject(department);
+            out.writeObject(filename);
+
+            // 5. Verify node response
+            String response = (String) in.readObject();
+            if (!"OK: File deleted".equals(response)) {
+                throw new RemoteException("Node error: " + response);
+            }
+
+            // 6. Verify file was actually deleted
+            if (verifyFileOnNode(metadata.getNodeAddress(), metadata.getNodePort(), department, filename)) {
+                throw new RemoteException("Verification failed: File still exists on node");
+            }
+
+            return true;
+        } catch (Exception e) {
+            throw new RemoteException("Failed to delete file: " + e.getMessage());
+        }
+    }
+
+    private boolean verifyFileOnNode(String nodeAddress, int nodePort, String department, String filename) {
+        try (Socket socket = new Socket(nodeAddress, nodePort);
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("VERIFY");
+            out.writeObject(department);
+            out.writeObject(filename);
+
+            return (boolean) in.readObject();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+}
+
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.util.List;
+
+public interface CoordinatorInterface extends Remote {
+    String login(String username, String password) throws RemoteException;
+    boolean registerUser(String managerToken, User user) throws RemoteException;
+    FileMetadata searchFile(String token, String filename, String department) throws RemoteException;
+    boolean uploadFile(String token, FileData file) throws RemoteException;
+    boolean createFile(String token, FileData file) throws RemoteException;
+    byte[] readFile(String token, String filename, String department) throws RemoteException;
+
+    List<NodeInfo> getActiveNodes() throws RemoteException;
+    boolean addNode(String managerToken, NodeInfo node) throws RemoteException;
+    boolean updateFile(String token, FileData file) throws RemoteException;
+    boolean syncAllNodes(String managerToken) throws RemoteException;
+    User getUserByToken(String token) throws RemoteException;
+    boolean deleteFile(String token, String filename, String department) throws RemoteException;
+
+}
+import java.io.File;
+import java.rmi.Naming;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class CoordinatorServer {
+    private static final List<Process> nodeProcesses = new ArrayList<>();
+    private static final List<NodeInfo> testNodes = new ArrayList<>();
+    private static final ExecutorService executor = Executors.newCachedThreadPool();
+
+    public static void main(String[] args) {
+        try {
+            // Start RMI registry
+            LocateRegistry.createRegistry(1099);
+
+            // Initialize test nodes
+            initializeTestNodes();
+
+            // Start the coordinator with test nodes
+            CoordinatorInterface coordinator = new CoordinatorImpl();
+            addTestNodesToCoordinator(coordinator);
+
+            Naming.rebind("Coordinator", coordinator);
+            System.out.println("Coordinator server is running...");
+
+            // Add shutdown hook
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                shutdownNodes();
+            }));
+
+        } catch (Exception e) {
+            System.err.println("Coordinator server exception: " + e);
+            shutdownNodes();
+            System.exit(1);
+        }
+    }
+
+    private static void initializeTestNodes() throws Exception {
+        // Define test nodes
+        testNodes.add(new NodeInfo("node1", "localhost", 8001));
+        testNodes.add(new NodeInfo("node2", "localhost", 8002));
+        testNodes.add(new NodeInfo("node3", "localhost", 8003));
+
+        // Start node processes
+        for (NodeInfo node : testNodes) {
+            startNodeProcess(node);
+        }
+
+        // Wait for nodes to initialize
+        Thread.sleep(2000);
+        System.out.println("Initialized test nodes:");
+        testNodes.forEach(node ->
+                System.out.println("- " + node.getNodeId() + " at " + node.getAddress() + ":" + node.getPort()));
+    }
+
+    private static void startNodeProcess(NodeInfo node) {
+        executor.submit(() -> {
+            try {
+                ProcessBuilder pb = new ProcessBuilder(
+                        "java", "NodeServer", node.getNodeId(), String.valueOf(node.getPort()));
+                pb.redirectOutput(new File(node.getNodeId() + "_output.log"));
+                pb.redirectError(new File(node.getNodeId() + "_error.log"));
+                Process process = pb.start();
+                nodeProcesses.add(process);
+            } catch (Exception e) {
+                System.err.println("Error starting " + node.getNodeId() + ": " + e.getMessage());
+            }
+        });
+    }
+
+    private static void addTestNodesToCoordinator(CoordinatorInterface coordinator) throws RemoteException {
+        for (NodeInfo node : testNodes) {
+            coordinator.addNode("MANAGER_TOKEN", node);
+        }
+    }
+
+    private static void shutdownNodes() {
+        System.out.println("Shutting down node servers...");
+        nodeProcesses.forEach(p -> {
+            if (p.isAlive()) p.destroy();
+        });
+        executor.shutdown();
+    }
+}
+
+import java.io.*;
+import java.net.*;
+import java.rmi.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class FileClient {
+    private CoordinatorInterface coordinator;
+    private String token;
+    private Scanner scanner = new Scanner(System.in);
+
+    public FileClient() {
+        try {
+            coordinator = (CoordinatorInterface) Naming.lookup("rmi://localhost/Coordinator");
+        } catch (Exception e) {
+            System.err.println("Error connecting to coordinator: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    public void start() {
+        System.out.println("1. Login");
+        System.out.println("2. Register (Manager only)");
+        System.out.print("Choose option: ");
+        int option = scanner.nextInt();
+        scanner.nextLine(); // consume newline
+
+        try {
+            if (option == 1) {
+                login();
+            } else if (option == 2) {
+                registerUser();
+            } else {
+                System.out.println("Invalid option");
+                return;
+            }
+
+            if (token != null) {
+                showMainMenu();
+            }
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+        }
+    }
+
+    private void login() throws RemoteException {
+        System.out.print("Username: ");
+        String username = scanner.nextLine();
+        System.out.print("Password: ");
+        String password = scanner.nextLine();
+
+        token = coordinator.login(username, password);
+        System.out.println("Login successful. Your token: " + token);
+    }
+
+    private void registerUser() throws RemoteException {
+        System.out.print("Manager token: ");
+        String managerToken = scanner.nextLine();
+
+        System.out.print("New username: ");
+        String username = scanner.nextLine();
+        System.out.print("New password: ");
+        String password = scanner.nextLine();
+        System.out.print("Department: ");
+        String department = scanner.nextLine();
+
+        User newUser = new User(username, password, department);
+        if (coordinator.registerUser(managerToken, newUser)) {
+            System.out.println("User registered successfully");
+        }
+    }
+
+    private void showMainMenu() throws RemoteException, IOException, ClassNotFoundException {
+        while (true) {
+            System.out.println("\nMain Menu:");
+            System.out.println("1. Create new file");
+            System.out.println("2. Download file");
+            System.out.println("3. Read file");
+            System.out.println("4. Update file");
+            System.out.println("5. Delete file");
+
+            System.out.println("6. Exit");
+            User currentUser = coordinator.getUserByToken(token);
+            if (currentUser != null && currentUser.hasPermission("manage_nodes")) {
+                System.out.println("7. Manager Options");
+            }
+
+
+            int option = scanner.nextInt();
+            scanner.nextLine(); // consume newline
+
+            switch (option) {
+                case 1:
+                    uploadFile();
+                    break;
+                case 2:
+                    downloadFile();
+                    break;
+                case 3:
+                    readFile();
+                    break;
+                case 4:
+                    updateFile();
+                    break;
+                case 5:
+                    deleteFile();
+                    break;
+
+                case 6:
+                    return;
+                case 7:
+                    if (currentUser != null && currentUser.hasPermission("manage_nodes")) {
+                        showManagerMenu();
+                    } else {
+                        System.out.println("Invalid option");
+                    }
+                    break;
+
+                default:
+                    System.out.println("Invalid option");
+            }
+        }
+    }
+
+    private void showManagerMenu() throws RemoteException {
+        while (true) {
+            System.out.println("\nManager Menu:");
+            System.out.println("1. Sync all nodes");
+            System.out.println("2. Back to main menu");
+
+            int option = scanner.nextInt();
+            scanner.nextLine(); // consume newline
+
+            switch (option) {
+                case 1:
+                    System.out.println("Starting full node synchronization...");
+                    if (coordinator.syncAllNodes(token)) {
+                        System.out.println("Synchronization completed successfully");
+                    } else {
+                        System.out.println("Synchronization failed");
+                    }
+                    break;
+                case 2:
+                    return;
+                default:
+                    System.out.println("Invalid option");
+            }
+        }
+    }
+
+
+    private void deleteFile() {
+        try {
+            System.out.print("File name to delete: ");
+            String filename = scanner.nextLine();
+            System.out.print("Department: ");
+            String department = scanner.nextLine();
+
+            if (coordinator.deleteFile(token, filename, department)) {
+                System.out.println("File deleted successfully");
+            } else {
+                System.out.println("Failed to delete file");
+            }
+        } catch (Exception e) {
+            System.err.println("Error deleting file: " + e.getMessage());
+        }
+    }
+
+
+    private void readFile() {
+        try {
+            System.out.print("File name: ");
+            String filename = scanner.nextLine();
+            System.out.print("Department: ");
+            String department = scanner.nextLine();
+
+            byte[] content = coordinator.readFile(token, filename, department);
+            System.out.println("\nFile content:");
+            System.out.println(new String(content));
+            System.out.println("\n--- End of file ---");
+        } catch (Exception e) {
+            System.err.println("Error reading file: " + e.getMessage());
+        }
+    }
+
+
+    private void updateFile() {
+        try {
+            System.out.print("File name to update: ");
+            String filename = scanner.nextLine();
+            System.out.print("Department: ");
+            String department = scanner.nextLine();
+
+            // First read the current file to show to user
+            byte[] currentContent = coordinator.readFile(token, filename, department);
+            System.out.println("\nCurrent file content:");
+            System.out.println(new String(currentContent));
+            System.out.println("\n--- End of current content ---");
+
+            System.out.println("Enter new content (type 'END' on a new line to finish):");
+            StringBuilder contentBuilder = new StringBuilder();
+            String line;
+            while (!(line = scanner.nextLine()).equals("END")) {
+                contentBuilder.append(line).append("\n");
+            }
+
+            // Remove the last newline character
+            if (contentBuilder.length() > 0) {
+                contentBuilder.setLength(contentBuilder.length() - 1);
+            }
+
+            byte[] newContent = contentBuilder.toString().getBytes();
+            FileData fileData = new FileData(filename, department, newContent, token);
+
+            if (coordinator.updateFile(token, fileData)) {
+                System.out.println("File updated successfully");
+            } else {
+                System.out.println("Failed to update file");
+            }
+        } catch (Exception e) {
+            System.err.println("Error updating file: " + e.getMessage());
+        }
+    }
+
+
+
+    private void uploadFile() throws RemoteException, IOException {
+        System.out.print("Enter new file name: ");
+        String filename = scanner.nextLine();
+        System.out.print("Department: ");
+        String department = scanner.nextLine();
+        System.out.println("Enter file content (type 'END' on a new line to finish):");
+
+        StringBuilder contentBuilder = new StringBuilder();
+        String line;
+        while (!(line = scanner.nextLine()).equals("END")) {
+            contentBuilder.append(line).append("\n");
+        }
+
+        // Remove the last newline character
+        if (contentBuilder.length() > 0) {
+            contentBuilder.setLength(contentBuilder.length() - 1);
+        }
+
+        byte[] content = contentBuilder.toString().getBytes();
+        FileData fileData = new FileData(filename, department, content, token);
+
+        if (coordinator.createFile(token, fileData)) {
+            System.out.println("File created successfully");
+        } else {
+            System.out.println("Failed to create file");
+        }
+    }
+
+    private void downloadFile() throws RemoteException {
+        System.out.print("File name: ");
+        String filename = scanner.nextLine();
+        System.out.print("Department: ");
+        String department = scanner.nextLine();
+
+        try {
+            FileMetadata metadata = coordinator.searchFile(token, filename, department);
+            if (metadata == null) {
+                System.out.println("File not found in index");
+                return;
+            }
+
+            System.out.println("Attempting download from: " +
+                            metadata.getNodeAddress() + ":" + metadata.getNodePort());
+
+            try (Socket socket = new Socket(metadata.getNodeAddress(), metadata.getNodePort());
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+                out.writeObject("DOWNLOAD");
+                out.writeObject(department);
+                out.writeObject(filename);
+
+                Object response = in.readObject();
+                if (response instanceof FileData) {
+                    FileData fileData = (FileData) response;
+                    System.out.print("Save as: ");
+                    String savePath = scanner.nextLine();
+                    Files.write(Paths.get(savePath), fileData.getContent());
+                    System.out.println("Download successful!");
+                } else {
+                    System.out.println("Error: " + response);
+                }
+            } catch (java.net.ConnectException e) {
+                System.err.println("\u001B[31mNode unavailable\u001B[0m: " + e.getMessage());
+                System.err.println("Please ensure node " + metadata.getNodeAddress() +
+                                " is running on port " + metadata.getNodePort());
+            }
+        } catch (Exception e) {
+            System.err.println("Download failed: " + e.getMessage());
+        }
+    }
+
+    private void searchFile() throws RemoteException {
+        System.out.print("File name: ");
+        String filename = scanner.nextLine();
+        System.out.print("Department: ");
+        String department = scanner.nextLine();
+
+        FileMetadata metadata = coordinator.searchFile(token, filename, department);
+        if (metadata != null) {
+            System.out.println("File found on node: " + metadata.getNodeAddress() + ":" + metadata.getNodePort());
+        } else {
+            System.out.println("File not found");
+        }
+    }
+
+    public static void main(String[] args) {
+        new FileClient().start();
+    }
+}
+
+import java.io.Serializable;
+
+public class FileData implements Serializable {
+    private String filename;
+    private String department;
+    private byte[] content;
+    private String owner;
+
+    public FileData(String filename, String department, byte[] content, String owner) {
+        this.filename = filename;
+        this.department = department;
+        this.content = content;
+        this.owner = owner;
+    }
+
+    // Getters and setters
+    public String getFilename() { return filename; }
+    public String getDepartment() { return department; }
+    public byte[] getContent() { return content; }
+    public String getOwner() { return owner; }
+}
+
+import java.io.Serializable;
+
+public class FileMetadata implements Serializable {
+    private String filename;
+    private String department;
+    private String nodeAddress;
+    private int nodePort;
+
+    public FileMetadata(String filename, String department, String nodeAddress, int nodePort) {
+        this.filename = filename;
+        this.department = department;
+        this.nodeAddress = nodeAddress;
+        this.nodePort = nodePort;
+    }
+
+    // Getters
+    public String getFilename() { return filename; }
+    public String getDepartment() { return department; }
+    public String getNodeAddress() { return nodeAddress; }
+    public int getNodePort() { return nodePort; }
+}
+import java.io.Serializable;
+
+public class NodeInfo implements Serializable {
+    private String nodeId;
+    private String address;
+    private int port;
+    private boolean active;
+
+    public NodeInfo(String nodeId, String address, int port) {
+        this.nodeId = nodeId;
+        this.address = address;
+        this.port = port;
+        this.active = true;
+    }
+
+    // Getters and setters
+    public String getNodeId() { return nodeId; }
+    public String getAddress() { return address; }
+    public int getPort() { return port; }
+    public boolean isActive() { return active; }
+    public void setActive(boolean active) { this.active = active; }
+}
+
+import java.io.*;
+import java.net.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class NodeServer {
+    private final String nodeId;
+    private final int port;
+    private final String storagePath;
+    private boolean running = true;
+
+    public NodeServer(String nodeId, int port) {
+        this.nodeId = nodeId;
+        this.port = port;
+        this.storagePath = "node_storage_" + nodeId;
+        initializeStorage();
+    }
+
+    private void initializeStorage() {
+        try {
+            Path path = Paths.get(storagePath);
+            if (!Files.exists(path)) {
+                Files.createDirectories(path);
+            }
+            System.out.println("[" + nodeId + "] Storage initialized at: " +
+                            path.toAbsolutePath());
+        } catch (IOException e) {
+            System.err.println("[" + nodeId + "] Failed to initialize storage: " +
+                            e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    public void start() {
+        try (ServerSocket serverSocket = new ServerSocket(port, 50, InetAddress.getByName("0.0.0.0"))) {
+            System.out.println("[" + nodeId + "] Started on " +
+                            serverSocket.getLocalSocketAddress());
+
+            while (running) {
+                try {
+                    Socket clientSocket = serverSocket.accept();
+                    System.out.println("[" + nodeId + "] Connection from: " +
+                                    clientSocket.getInetAddress());
+                    new Thread(() -> handleClient(clientSocket)).start();
+                } catch (IOException e) {
+                    System.err.println("[" + nodeId + "] Accept error: " + e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("[" + nodeId + "] Server error: " + e.getMessage());
+        }
+    }
+
+    private void handleClient(Socket clientSocket) {
+        try (ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
+             ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream())) {
+
+            String command = (String) in.readObject();
+            System.out.println("[" + nodeId + "] Received command: " + command);
+
+            switch (command) {
+                case "UPLOAD":
+                    handleUpload(in, out);
+                    break;
+                case "DOWNLOAD":
+                    handleDownload(in, out);
+                    break;
+                case "VERIFY":
+                    handleVerify(in, out);
+                    break;
+                case "SYNC":
+                    handleSync(in, out);
+                    break;
+                case "UPDATE":
+                    handleUpdate(in, out);
+                    break;
+                case "VERIFY_CONTENT":
+                    handleVerifyContent(in, out);
+                    break;
+                case "DELETE":
+                    handleDelete(in, out);
+                    break;
+
+
+                default:
+                    out.writeObject("ERROR: Unknown command: " + command);
+            }
+        } catch (Exception e) {
+            System.err.println("[" + nodeId + "] Client handling error: " + e.getMessage());
+        } finally {
+            try {
+                clientSocket.close();
+            } catch (IOException e) {
+                System.err.println("[" + nodeId + "] Error closing socket: " + e.getMessage());
+            }
+        }
+    }
+
+    private void handleUpdate(ObjectInputStream in, ObjectOutputStream out)
+            throws IOException, ClassNotFoundException {
+        FileData fileData = (FileData) in.readObject();
+        System.out.println("[" + nodeId + "] Updating: " + fileData.getFilename() +
+                " in " + fileData.getDepartment());
+
+        Path deptPath = Paths.get(storagePath, fileData.getDepartment());
+        Path filePath = deptPath.resolve(fileData.getFilename());
+
+        if (!Files.exists(filePath)) {
+            out.writeObject("ERROR: File not found");
+            return;
+        }
+
+        Files.write(filePath, fileData.getContent(),
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE);
+
+        System.out.println("[" + nodeId + "] Updated: " + filePath.toAbsolutePath());
+        out.writeObject("OK: File updated");
+    }
+
+    private void handleDelete(ObjectInputStream in, ObjectOutputStream out)
+            throws IOException, ClassNotFoundException {
+
+        String department = (String) in.readObject();
+        String filename = (String) in.readObject();
+        System.out.println("[" + nodeId + "] Delete request: " + department + "/" + filename);
+
+        Path filePath = Paths.get(storagePath, department, filename);
+        if (!Files.exists(filePath)) {
+            out.writeObject("ERROR: File not found");
+            return;
+        }
+
+        try {
+            Files.delete(filePath);
+            out.writeObject("OK: File deleted");
+            System.out.println("[" + nodeId + "] Deleted: " + filePath);
+        } catch (IOException e) {
+            System.err.println("[" + nodeId + "] Delete error: " + e.getMessage());
+            out.writeObject("ERROR: Could not delete file");
+        }
+    }
+
+
+    private void handleVerifyContent(ObjectInputStream in, ObjectOutputStream out)
+            throws IOException, ClassNotFoundException {
+        String department = (String) in.readObject();
+        String filename = (String) in.readObject();
+        byte[] expectedContent = (byte[]) in.readObject();
+
+        Path filePath = Paths.get(storagePath, department, filename);
+        if (!Files.exists(filePath)) {
+            out.writeObject(false);
+            return;
+        }
+
+        byte[] actualContent = Files.readAllBytes(filePath);
+        out.writeObject(Arrays.equals(expectedContent, actualContent));
+    }
+
+
+    private void handleUpload(ObjectInputStream in, ObjectOutputStream out)
+            throws IOException, ClassNotFoundException {
+
+        FileData fileData = (FileData) in.readObject();
+        System.out.println("[" + nodeId + "] Creating: " + fileData.getFilename() +
+                " in " + fileData.getDepartment());
+
+        Path deptPath = Paths.get(storagePath, fileData.getDepartment());
+        if (!Files.exists(deptPath)) {
+            Files.createDirectories(deptPath);
+        }
+
+        Path filePath = deptPath.resolve(fileData.getFilename());
+        Files.write(filePath, fileData.getContent(),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING);
+
+        System.out.println("[" + nodeId + "] Created: " + filePath.toAbsolutePath());
+        out.writeObject("OK: File created");  // Make sure this matches exactly
+    }
+
+
+    private void handleDownload(ObjectInputStream in, ObjectOutputStream out)
+        throws IOException, ClassNotFoundException {
+
+        String department = (String) in.readObject();
+        String filename = (String) in.readObject();
+        System.out.println("[" + nodeId + "] Download request: " +
+                         department + "/" + filename);
+
+        Path filePath = Paths.get(storagePath, department, filename);
+        if (!Files.exists(filePath)) {
+            System.err.println("[" + nodeId + "] File not found: " + filePath);
+            out.writeObject("ERROR: File not found");
+            return;
+        }
+
+        try {
+            byte[] content = Files.readAllBytes(filePath);
+            FileData fileData = new FileData(filename, department, content, "system");
+            out.writeObject(fileData);
+            System.out.println("[" + nodeId + "] Sent file: " + filename +
+                            " (" + content.length + " bytes)");
+        } catch (IOException e) {
+            System.err.println("[" + nodeId + "] Read error: " + e.getMessage());
+            out.writeObject("ERROR: Could not read file");
+        }
+    }
+
+    private void handleVerify(ObjectInputStream in, ObjectOutputStream out)
+        throws IOException, ClassNotFoundException {
+
+        String department = (String) in.readObject();
+        String filename = (String) in.readObject();
+        System.out.println("[" + nodeId + "] Verifying: " +
+                         department + "/" + filename);
+
+        Path filePath = Paths.get(storagePath, department, filename);
+        boolean exists = Files.exists(filePath);
+
+        System.out.println("[" + nodeId + "] Verification result: " + exists);
+        out.writeObject(exists);
+    }
+
+    private void handleSync(ObjectInputStream in, ObjectOutputStream out)
+        throws IOException, ClassNotFoundException {
+
+        String department = (String) in.readObject();
+        String filename = (String) in.readObject();
+        System.out.println("[" + nodeId + "] Sync request: " +
+                         department + "/" + filename);
+
+        Path filePath = Paths.get(storagePath, department, filename);
+        if (Files.exists(filePath)) {
+            byte[] content = Files.readAllBytes(filePath);
+            out.writeObject(content);
+            System.out.println("[" + nodeId + "] Sent sync data: " +
+                              filename + " (" + content.length + " bytes)");
+        } else {
+            out.writeObject(null);
+            System.out.println("[" + nodeId + "] No file to sync");
+        }
+    }
+
+    public static void main(String[] args) {
+        if (args.length != 2) {
+            System.out.println("Usage: java NodeServer <nodeId> <port>");
+            System.out.println("Example: java NodeServer node1 8001");
+            return;
+        }
+
+        String nodeId = args[0];
+        int port = Integer.parseInt(args[1]);
+
+        NodeServer node = new NodeServer(nodeId, port);
+        node.start();
+    }
+}
+
+import java.io.*;
+import java.net.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class NodeSyncClient {
+    private List<NodeInfo> nodes;
+    private String nodeId;
+    private String storagePath;
+
+    public NodeSyncClient(String nodeId, List<NodeInfo> nodes) {
+        this.nodeId = nodeId;
+        this.nodes = nodes;
+        this.storagePath = "node_storage_" + nodeId;
+    }
+
+    public void sync() {
+        for (NodeInfo node : nodes) {
+            if (!node.getNodeId().equals(nodeId)) { // Don't sync with self
+                syncWithNode(node);
+            }
+        }
+    }
+
+    private void syncWithNode(NodeInfo node) {
+        try {
+            // Get list of departments
+            File storageDir = new File(storagePath);
+            if (!storageDir.exists()) return;
+
+            for (File deptDir : storageDir.listFiles(File::isDirectory)) {
+                String department = deptDir.getName();
+
+                for (File file : deptDir.listFiles()) {
+                    syncFile(node, department, file.getName());
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Sync error with node " + node.getNodeId() + ": " + e.getMessage());
+        }
+    }
+
+    private void syncFile(NodeInfo node, String department, String filename) {
+        try (Socket socket = new Socket(node.getAddress(), node.getPort());
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject("SYNC");
+            out.writeObject(department);
+            out.writeObject(filename);
+
+            byte[] remoteContent = (byte[]) in.readObject();
+            byte[] localContent = Files.readAllBytes(Paths.get(storagePath, department, filename));
+
+            if (remoteContent == null) {
+                // File doesn't exist on remote node, send our copy
+                sendFile(node, department, filename);
+            } else if (!Arrays.equals(remoteContent, localContent)) {
+                // Files are different, implement conflict resolution
+                // For simplicity, we'll just keep both versions with timestamps
+                resolveConflict(node, department, filename, remoteContent, localContent);
+            }
+        } catch (Exception e) {
+            System.err.println("Error syncing file " + filename + ": " + e.getMessage());
+        }
+    }
+
+    private void sendFile(NodeInfo node, String department, String filename) throws IOException {
+        try (Socket socket = new Socket(node.getAddress(), node.getPort());
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            byte[] content = Files.readAllBytes(Paths.get(storagePath, department, filename));
+            FileData fileData = new FileData(filename, department, content, "sync");
+
+            out.writeObject("UPLOAD");
+            out.writeObject(fileData);
+
+            String response = (String) in.readObject();
+            if (!"OK: File uploaded".equals(response)) {
+                System.err.println("Failed to sync file " + filename + ": " + response);
+            }
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    public String getNodeId() {
+        return nodeId;
+    }
+
+
+    private void resolveConflict(NodeInfo node, String department, String filename,
+                               byte[] remoteContent, byte[] localContent) throws IOException {
+        // Simple conflict resolution - keep both versions with timestamps
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String newFilename = filename + "_conflict_" + timestamp;
+
+        Files.write(Paths.get(storagePath, department, newFilename), localContent);
+        System.out.println("Resolved conflict for " + filename + " by creating " + newFilename);
+    }
+}
+
+import java.io.Serializable;
+import java.util.HashSet;
+import java.util.Set;
+
+public class User implements Serializable {
+    private String username;
+    private String password;
+    private String department;
+    private Set<String> permissions;
+    private String token;
+
+    public User(String username, String password, String department) {
+        this.username = username;
+        this.password = password;
+        this.department = department;
+        this.permissions = new HashSet<>();
+    }
+
+    // Getters and setters
+    public String getUsername() { return username; }
+    public String getPassword() { return password; }
+    public String getDepartment() { return department; }
+    public Set<String> getPermissions() { return permissions; }
+    public String getToken() { return token; }
+    public void setToken(String token) { this.token = token; }
+
+    public void addPermission(String permission) {
+        permissions.add(permission);
+    }
+
+    public boolean hasPermission(String permission) {
+        return permissions.contains(permission);
+    }
+}
